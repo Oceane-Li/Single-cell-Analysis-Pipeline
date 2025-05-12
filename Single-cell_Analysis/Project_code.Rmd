@@ -1,0 +1,1298 @@
+---
+title: "Guided Project (AdSP)"
+author: "Océane Li"
+date: "2024-11-12"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+# Introduction
+
+In this guided project, we are going to implement the classical pipeline to identify cellular populations (as seen during the practical session). We will work on an unpublished dataset downloaded from Moodle.
+
+```{r}
+# fix the random seed for reproducibility of the results
+the.seed <-42
+set.seed(the.seed)
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(SingleCellExperiment)
+library(scDblFinder)
+library(biomaRt)
+```
+
+```{r}
+sample.name <- "New_data"
+species <- "drosophila melanogaster"
+```
+
+# Data filtering
+
+## 1. Import data and create a Seurat object
+
+```{r}
+#load the data (in the sparse format)
+scmat <- Read10X('rep2')
+# sparse matrix
+class(scmat)
+# extract some data
+scmat[1:5,1:4]
+print(dim(scmat))
+```
+
+A "dgCMatrix" : efficient way to store an array with a lot of zeros in a computer (sparse matrix). We have 17753 genes and 2331657 "barcodes", which means that most of the beads are empty.
+
+To work with Seurat, we need to create a Seurat object. While creating the Seurat object, we can perform a first filtering: we exclude cells that contain less than 200 genes (undersequenced cells or debris) and genes that are expressed in only 5 cells.
+
+```{r}
+sobj <- CreateSeuratObject(counts = scmat, 
+                           min.cells = 5, 
+                           min.features = 200,
+                           project = sample.name)
+class(sobj)
+
+# Barcodes names 
+head(colnames(sobj))
+# features names (genes) 
+head(rownames(sobj))
+
+# number of features (genes) 
+print(paste("Number of genes :", nrow(sobj)))
+# number of barcodes 
+print(paste("Number of barcodes :", ncol(sobj)))
+# print Seurat
+sobj
+```
+
+After this first filtering, we have 11752 features (=number of genes) and 43688 "barcodes" (=number of cells). Beads with too few expressed genes were removed -\> probably empty cells.
+
+Now that we created the Seurat object, we do not need `scmat` anymore. We remove it to free space.
+
+```{r}
+rm(scmat)
+```
+
+## 2. Convert the ID to gene symbol with biomaRt
+
+Once we have loaded the ‘biomaRt’ library, we can connect to BioMart.
+
+```{r}
+# mart contains information about drosophila's genes from 'ensembl'
+mart <- useMart("ensembl", dataset = "dmelanogaster_gene_ensembl")
+
+# retrieve ID <-> symbol matches
+gene_mapping <- getBM(attributes = c("ensembl_gene_id", "external_gene_name"),
+                      filters = "ensembl_gene_id",
+                      values = rownames(sobj),
+                      mart = mart)
+
+# correlation table
+gene_lookup <- setNames(gene_mapping$external_gene_name, gene_mapping$ensembl_gene_id)
+
+# update genes names in Seurat
+rownames(sobj) <- ifelse(rownames(sobj) %in% names(gene_lookup),
+                         gene_lookup[rownames(sobj)],
+                         rownames(sobj))
+```
+
+```{r}
+# check
+head(rownames(sobj))
+```
+
+```{r}
+rm(gene_mapping, gene_lookup)
+```
+
+## 3. Descriptive analysis of the data
+
+1.  We are going to examine the metadata of the Seurat object: this contains global information about the cells, such as the number of UMI or genes expressed in each cell.
+
+```{r}
+# view the first 10 lines of metadata
+head(sobj@meta.data, 10)
+```
+
+2.  The total number of UMI (=number of RNA molecules) in a cell indicates overall transcriptional activity.
+
+```{r}
+summary(sobj$nCount_RNA)
+
+# distribution of the number of UMI per cell (histogram)
+hist(log(sobj$nCount_RNA), breaks = 200, main = "Distribution of UMI counts (nCount_RNA) per cell", xlab = "Number of UMI (nCount_RNA)", ylab = "Frequency")
+```
+
+3.  Number of genes expressed per cell: this reflects the transcriptional diversity of each cell.
+
+```{r}
+summary(sobj$nFeature_RNA)
+
+# distribution of the number of genes expressed per cell
+hist(log(sobj$nFeature_RNA), breaks = 200, main = "Distribution of number of genes (nFeature_RNA) detected per cell",
+     xlab = "Number of genes (nFeature_RNA)", ylab = "Frequency")
+```
+
+## 4. Filtering the data
+
+-   Filter out *low quality* cells: undersequenced cells, debris (broken cells or floating pieces of RNA) and doublets/multiplets (several cells in one droplets)
+-   Normalize the UMI expression to reduce the sequencing biais (some cells are less sequenced than others).
+
+The are a few metrics commonly used to filter out low quality cells :
+
+-   the number of unique genes detected in each cell
+-   cells with low gene count : helps to remove empty droplets, debris and undersequenced cells.
+-   cells with high gene count : these cells are more likely to be cell homotypic doublets or multiplets. The number of multiplets expected in our sample is directly linked with the number of cells we loaded in the machine. The more cells we loaded, the higher the chance is to have 2 or more cells in one droplet.
+-   the total number of UMI detected within a cell.
+-   the total number of UMI and the number of genes are highly correlated. Looking at the scatter plot between these two variables helps us detect atypical cells.
+-   the percentage of reads that map to the mitochondrial genome.
+-   low-quality / dying cells often exhibit extensive mitochondrial contamination.
+
+Seurat allows us to easily explore these QC (quality control) metrics and filter out cells.
+
+1.  For the number of UMI per cell (`nCount_RNA`):
+
+```{r}
+#violin plot + horizontal line to help set threshold
+VlnPlot(sobj, features = c("nCount_RNA"),alpha=0.1)+ geom_hline(yintercept = c(12000))
+
+#violin plot in a log scale
+VlnPlot(sobj, features = c("nCount_RNA"),log=TRUE,alpha=0.1) + 
+  geom_hline(yintercept = c(12000),log=TRUE) +
+  ggtitle("Log-scaled ViolinPlot of total UMI count per cell") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+2.  For the number of genes expressed per cell (`nFeature_RNA`):
+
+```{r}
+#violin plot + horizontal line to help set threshold
+VlnPlot(sobj, features = c("nFeature_RNA"),alpha=0.1)+ geom_hline(yintercept = c(2500))
+
+# violin plot in a log scale
+VlnPlot(sobj, features = c("nFeature_RNA"),log=TRUE,alpha = 0.1) + 
+  geom_hline(yintercept = c(2500),log=TRUE) +
+  ggtitle("Log-scaled ViolinPlot of detected genes per cell") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+For a clearer visualization of the thresholds, a log scale has been applied.
+
+3.  Relationship between the number of UMI and the number of genes expressed: this relationship can be visualized to identify anomalies such as doublets (cells with an unusually high number of UMI and expressed genes).
+
+```{r}
+FeatureScatter(sobj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA",pt.size =0.5)
+```
+
+4.  The Kneeplot can also be used to define thresholds.
+
+```{r}
+nb_umi_by_barcode <- data.frame(nb_umi = sobj$nCount_RNA) %>%
+  arrange(desc(nb_umi)) %>%
+  mutate(num_barcode = seq_along(nb_umi))
+
+ggplot(nb_umi_by_barcode, aes(x = num_barcode, y = nb_umi)) +
+  geom_point(alpha = 0.6, size = 1) +
+  geom_hline(yintercept = c(12000, 20000), linetype = "dashed", size = 0.8) +
+  ggtitle("Kneeplot : Distribution of UMIs per droplet") +
+  theme_minimal() +
+  theme(legend.title = element_blank(),
+        plot.title = element_text(hjust = 0.5, size = 14, face = "bold")) +
+  scale_y_log10(name = "Number of UMIs per droplet (log scale)") +
+  scale_x_log10(name = "Droplet number (log scale)") +
+  expand_limits(x = 1, y = 1)
+```
+
+```{r}
+rm(nb_umi_by_barcode)
+```
+
+Our aim while looking at these graphs is to define the thresholds/cutoffs that we will apply to filter cells out. To do so, we will try to identify the cells that behave differently from the main population. After eliminating empty droplets and droplets with too much gene expression (risk of doublet), the dead cells are removed too.
+
+```{r}
+# Define thresholds for filtering
+minGene <- 2500 
+minUMI <- 12000
+# maxGene <- 3100
+# maxUMI <- 20000
+maxPctMT <- 20 # Above 20% mitochondrial RNA expression, the cell is considered dead
+```
+
+To calculate the percentage of mitochondrial genes expressed in a cell, we must first provide a list of mitochondrial genes. We then use the `PercentageFeatureSet` function, which calculates the percentage of counts originating from a set of features.
+
+```{r}
+mito_genes <- getBM(
+    attributes = c("ensembl_gene_id", "external_gene_name", "description"),
+    filters = "chromosome_name",
+    values = "mitochondrion_genome",
+    mart = mart
+)
+head(mito_genes)
+```
+
+```{r}
+# compute mitochondrial gene percentage
+sobj$percent_mt <- PercentageFeatureSet(sobj, pattern = "^mt:")
+summary(sobj$percent_mt)
+```
+
+```{r}
+# visualize mitochondrial gene expression
+VlnPlot(sobj, features = "percent_mt", log = TRUE, alpha = 0.1) +
+  geom_hline(yintercept = maxPctMT) +
+  ggtitle("Percentage of mitochondrial RNA (percent_mt) per cell") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+# we create a new seurat object containing the filtred cells based on all thresholds
+sobj_filtrd <- subset(
+  sobj,
+  subset = nFeature_RNA > minGene & 
+           nCount_RNA > minUMI & 
+           percent_mt < maxPctMT
+)
+summary(sobj_filtrd$nCount_RNA)
+summary(sobj_filtrd$nFeature_RNA)
+summary(sobj_filtrd$percent_mt)
+```
+
+We filter out unwanted cells:
+
+```{r}
+cat("Number of cells before filtering:", ncol(sobj), "\n")
+cat("Number of cells after filtering:", ncol(sobj_filtrd), "\n")
+```
+
+```{r}
+rm(mart, mito_genes)
+```
+
+## 5. An automatic method to identify doublets
+
+To automatically identify doublets, we can use a package such as `scDblFinder`. This package requires a `SingleCellExperiment` object, so the first step is converting the Seurat object. Then, we use `scDblFinder` to predict doublets: this function generates artificial doublets and determines whether real cells are close to these artificial ones in feature space.
+
+```{r}
+# convert seurat object to a SingleCellExperiment object
+sceobj <- as.SingleCellExperiment(sobj_filtrd)
+
+# use scDblFinder to predict doublets
+doublet_res <- scDblFinder(sceobj)
+
+# add doublet classification results to Seurat object
+sobj_filtrd$doublets.class <- doublet_res$scDblFinder.class
+
+# % of doublets 
+table(sobj_filtrd$doublets.class)
+```
+
+Filter out cells classified as doublets:
+
+```{r}
+# filtration to exclude doublets
+sobj_filtrd <- subset(sobj_filtrd, subset = doublets.class == "singlet")
+```
+
+```{r}
+rm(sobj,sceobj,doublet_res)
+```
+
+## 6. Normalize data
+
+As we noticed in the previous graphes, the cells do not have the same number of total UMI. This may be due biological differences (some cells express less RNA than other) but is likely to be the result of cell-specific sequencing bias (some cells have been less sequenced than other). The normalization step aims to correct for this bias.
+
+We are going to apply a global scaling method, which supposes that all cells have about the same RNA content. The `LogNormalize` method normalizes the expression measurements for each cell by the total expression, multiplies this by a scale factor (here the median total UMI per cell), and log-transforms the result.
+
+```{r}
+#log-normalization
+sobj_filtrd <- NormalizeData(sobj_filtrd, normalization.method = "LogNormalize", scale.factor = median(sobj_filtrd$nCount_RNA))
+```
+
+```{r}
+print(paste("Number of genes : ", nrow(sobj_filtrd), " Number of cells : ", ncol(sobj_filtrd)))
+```
+
+The resulting data are stored in the `data` layer.
+
+Once we have pre-processed our data, we are ready for further analyses (e.g. identify sub-population of cells, pseudo-time analyses).
+
+# Identification of cell populations
+
+In this section, we will analyse further the data and try to identify sub-populations of cells. The objective is to create clusters of cells, i.e to make groups of cells that share similar expression profile.
+
+The mains steps are as follow : - Select a subset of genes to perfom the downstream analyses : highly variable genes - Perform a dimension reduction (PCA) - Cluster the cells
+
+## 7. The most variable genes (hvg)
+
+The downstream analyses (dimension reduction and then clustering) will be performed on the subset of genes. The aims is to exclude genes with minor biological relevance and decrease the computational load.
+
+```{r}
+# Find Variable Genes (usually between 500 to 3000): 
+sobj_filtrd <- FindVariableFeatures(sobj_filtrd, selection.method = "vst", nfeatures = 2000,verbose = FALSE)
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(sobj_filtrd), 10)
+top10
+```
+
+Méthode utilisée: `FindVariableFeatures` avec la sélection "vst" (variance stabilizing transformation). Cette méthode est robuste et adaptée aux données de transcriptomique unicellulaire.
+
+Principe: la méthode calcule la variance pour chaque gène, puis applique une transformation stabilisante afin de contrôler l'effet de la moyenne d'expression. Les gènes qui ont une variance corrigée élevée sont considérés comme les plus variables.
+
+Avantages: - réduction du bruit associé aux gènes peu exprimés. - mise en avant des gènes présentant une variation biologique pertinente, souvent associée à des différences phénotypiques ou fonctionnelles entre les cellules. - contrôle des biais liés à la profondeur de séquençage.
+
+Ici, on a choisi d'extraire 2000 gènes (par défaut). Ensuite, les 10 premiers gènes les plus variables sont extraits pour un aperçu rapide.
+
+```{r}
+plot <- VariableFeaturePlot(sobj_filtrd)
+LabelPoints(plot = plot, points = top10, repel = TRUE, max.overlaps = 20)
+length(VariableFeatures(sobj_filtrd))
+```
+
+#### Check if the genes for cluster identification are expressed in the dataset
+
+```{r}
+# Gènes majoritairement exprimés dans les muscles
+list_muscle <- c('blow', 'Grip', 'Him', 'htl', 'Pdp1', 'sls')
+# Gènes majoritairement exprimés dans les précurseurs musculaires
+list_pre_muscle <- c('sns', 'Strn-Mlck', 'TpnC73F', 'sis')
+# Gènes majoritairement exprimés dans les tendons
+list_tendon <- c('Alk', 'Hand', 'kon', 'vkg')
+# Gènes majoritairement exprimés dans les SOP (précurseurs des organes sensoriels externes)
+list_sop <- c('ase', 'cpo', 'sca', 'sens')
+# Gènes majoritairement exprimés dans les hémocytes
+list_hemo <- c('eater', 'et', 'NimC4', 'srp')
+# Gènes majoritairement exprimés dans l'épithélium
+list_epi <- c('arm', 'baz', 'grh', 'hth', 'shg', 'zip', 'eyg')
+
+# check
+muscle_genes <- list_muscle[list_muscle %in% rownames(sobj_filtrd)]
+pre_muscle_genes <- list_pre_muscle[list_pre_muscle %in% rownames(sobj_filtrd)]
+tendon_genes <- list_tendon[list_tendon %in% rownames(sobj_filtrd)]
+sop_genes <- list_sop[list_sop %in% rownames(sobj_filtrd)]
+hemo_genes <- list_hemo[list_hemo %in% rownames(sobj_filtrd)]
+epi_genes <- list_epi[list_epi %in% rownames(sobj_filtrd)]
+```
+
+```{r}
+print("List of expressed muscle genes :")
+print(muscle_genes)
+
+print("List of expressed pre-muscle genes :")
+print(pre_muscle_genes)
+
+print("List of expressed tendon genes :")
+print(tendon_genes)
+
+print("List of expressed sop genes :")
+print(sop_genes)
+
+print("List of expressed hemo genes :")
+print(hemo_genes)
+
+print("List of expressed epi genes :")
+print(epi_genes)
+```
+
+## 8. PCA on the variable genes + UMAP visualization
+
+Before performing PCA, we scale the data. Expression of each gene is scaled (centered around its mean with a unit standard deviation). This step gives equal weight to all genes while performing the in the dimension reduction, and insures that the most expressed genes do not dominate.
+
+```{r}
+sobj_filtrd <- ScaleData(sobj_filtrd)
+```
+
+By default, scaling is only performed on the variable genes.
+
+Even though, the gene selection step reduces the data considerably, there is a further need to reduce dimension to keep the most important variability in the data. There are several methods for dimension reduction, the most commonly used is PCA.
+
+```{r}
+sobj_PC10 <- RunPCA(sobj_filtrd, features = VariableFeatures(object = sobj_filtrd))
+```
+
+It is worth analysing the genes that contribute the most to each axes. It may help us to identify genes whose expression decrease/increase together. The DimHeatmap function in Seurat helps us to visualize the genes that are driving the components and allows to get some insight about the heterogeneity of the data.
+
+```{r}
+# visualize the PCA results in a 2D plot.
+# each point represents a single cell, positioned based on the first two principal components.
+DimPlot(sobj_PC10, reduction = "pca")
+
+# create an elbow plot to determine the optimal number of principal components (PCs) to retain.
+# the plot shows the amount of variance explained by each PC.
+# the "elbow" point, where the explained variance starts to plateau, suggests the optimal number of PCs.
+ElbowPlot(sobj_PC10)
+```
+
+After PCA, we need to decide how many components we want to keep for UMAP and/or clustering. Alternatively we plot the explained variance using the ElbowPlot. In this practical case, we will test with different numbers of PC from 10 to 50, in steps of 10.
+
+### 8.1 Number of principal components = 10
+
+```{r}
+# examine and visualize PCA results :
+print(sobj_PC10[["pca"]], dims = 1:10, nfeatures = 10)
+```
+
+#### Clustering of the data
+
+There are two main steps to cluster the cells:
+
+-   Make a shared Nearest Neighbor graph: identify the k-nearest neighbours (k-nn) of each cell (by default Seurat takes k=20 neighbours). The distance between cells is calculated using the coordinates obtained with the PCA.
+
+-   Make clusters (community of cells) using Leiden or Louvain algorithm. The number of clusters depends on the resolution parameter chosen: the higher the value of the parameter is, the more groups we will get.
+
+**nPC = variable à changer pour voir les différents clusters**
+
+```{r}
+# number of PC kepts for the analysis
+nPC = 10 # 10 à 50 avec un pas de 10
+# s-nn graph (nbre de voisin par défaut = 10)
+sobj_PC10 <- FindNeighbors(sobj_PC10, dims = 1:nPC) 
+# make the clusters (here we try 3 resolutions)
+sobj_PC10 <- FindClusters(sobj_PC10, resolution = c(0.2,0.5,1)) 
+```
+
+The various clusterings are stored in the last columns of the layer metadata.
+
+#### Visualization of clusters on UMAP
+
+Usually the clustering results are presented using UMAP (dimension reduction) which visually separates the group more nicely than PCA.
+
+```{r}
+#create umap
+sobj_PC10 <- RunUMAP(sobj_PC10, dims = 1:nPC)
+```
+
+Visualize clusters on UMAP:
+
+```{r}
+# specify the clustering we want to see
+Idents(sobj_PC10) <- 'RNA_snn_res.0.2'
+DimPlot(sobj_PC10, reduction = "umap", label=TRUE) + 
+  ggtitle("UMAP visualization of cell clusters with 10 PC (Resolution: 0.2)")+
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+#### Manual annotation of clusters
+
+```{r}
+# Charger les listes de gènes
+marker_genes <- list(
+    muscle = c('blow', 'Grip', 'Him', 'htl', 'Pdp1', 'sls'),
+    pre_muscle = c('sns', 'Strn-Mlck', 'TpnC73F', 'sis'),
+    tendon = c('Alk', 'Hand', 'kon', 'vkg'),
+    sop = c('ase', 'cpo', 'sca', 'sens'),
+    hemo = c('eater', 'et', 'NimC4', 'srp'),
+    epi = c('arm', 'baz', 'grh', 'hth', 'shg', 'zip', 'eyg')
+)
+
+# VlnPlot(sobj_PC10, features = marker_genes$muscle)
+# FeaturePlot(sobj_PC10, features = marker_genes$muscle)
+
+# nombre de gènes retenus par cluster
+sapply(marker_genes, length)
+```
+
+```{r}
+# Add score for each cell 
+indices_to_remove <- c()
+j <- 1
+
+for (i in seq(1, length(marker_genes))) {
+    #check marker is present in our dataset
+    marker_genes[[i]] <- marker_genes[[i]][which(marker_genes[[i]] %in% rownames(sobj_PC10))]
+    
+    if(length(marker_genes[[i]]) > 1) {
+    sobj_PC10 <- AddModuleScore(sobj_PC10,
+                                 features = marker_genes[i],
+                                 pool = NULL,
+                                 nbin = 5,
+                                 seed = 1,
+                                 ctrl = length(marker_genes[i]),
+                                 k = FALSE,
+                                 name = names(marker_genes[i]))
+    col_name <- names(marker_genes)[[i]]
+    col_name_val <- which(colnames(sobj_PC10[[]]) == paste0(col_name, 1))
+    colnames(sobj_PC10@meta.data)[col_name_val] <- col_name
+    } else {
+        indices_to_remove[j] <- i
+        j <- j + 1
+    }
+}
+
+marker_genes[indices_to_remove] <- NULL
+```
+
+```{r}
+for (f in names(marker_genes)){
+  print(VlnPlot(sobj_PC10, features = f))
+  print(FeaturePlot(sobj_PC10, features = f))
+}
+```
+
+#### Identification of marker genes using FindMarkers
+
+Objective: to systematically identify the most significant marker genes for each cluster based on differential expression.
+
+-   The `FindMarkers` function in Seurat was applied to compute the differential expression of genes across clusters.
+-   Results were filtered to retain statistically significant marker genes.
+
+```{r}
+# package pour accélérer l'exécution de FindMarker
+# install.packages('devtools')
+# devtools::install_github('immunogenomics/presto')
+```
+
+```{r}
+retained <- list()
+not_retained <- list()
+
+for (cluster in levels(Idents(sobj_PC10))) {
+  # find markers for the current cluster
+  markers <- FindMarkers(sobj_PC10, ident.1 = cluster, min.pct = 0.25)
+  
+  # thresholds
+  retained_df <- markers[markers$avg_log2FC > 2 & markers$p_val_adj < 0.05, ]
+  not_retained_df <- markers[!(markers$avg_log2FC > 2 & markers$p_val_adj < 0.05), ]
+  
+  if (nrow(retained_df) > 0) {
+    retained_df$cluster <- cluster
+    retained[[paste0("cluster_", cluster)]] <- retained_df
+  }
+  
+  if (nrow(not_retained_df) > 0) {
+    not_retained_df$cluster <- cluster
+    not_retained[[paste0("cluster_", cluster)]] <- not_retained_df
+  }
+}
+```
+
+```{r}
+# afficher les 5 premiers gènes retenus pour chaque cluster
+for (cluster_name in names(retained)) {
+  cat("\nCluster:", cluster_name, "\n")
+  print(head(retained[[cluster_name]], 5))
+}
+```
+
+```{r}
+genes_retained_dfs <- list()
+genes_not_retained_dfs <- list()
+
+for (cluster in levels(Idents(sobj_PC10))) {
+  # clusters' markers
+  markers <- FindMarkers(sobj_PC10, ident.1 = cluster, min.pct = 0.25)
+  
+  retained_df <- data.frame()
+  not_retained_df <- data.frame()
+  
+  for (category in names(marker_genes)) {
+    genes_in_category <- marker_genes[[category]]
+    
+    # Criteria filtering
+    retained <- markers[rownames(markers) %in% genes_in_category & 
+                        markers$avg_log2FC > 2 & 
+                        markers$p_val_adj < 0.05, ]
+    
+    not_retained <- markers[rownames(markers) %in% genes_in_category & 
+                            !(markers$avg_log2FC > 1 & markers$p_val_adj < 0.05), ]
+    
+    if (nrow(retained) > 0) {
+      retained$category <- category
+      retained_df <- rbind(retained_df, retained)
+    }
+    if (nrow(not_retained) > 0) {
+      not_retained$category <- category
+      not_retained_df <- rbind(not_retained_df, not_retained)
+    }
+  }
+  
+  # Store the results in lists by cluster
+  if (nrow(retained_df) > 0) {
+    genes_retained_dfs[[paste0("cluster_", cluster)]] <- retained_df
+  }
+  if (nrow(not_retained_df) > 0) {
+    genes_not_retained_dfs[[paste0("cluster_", cluster)]] <- not_retained_df
+  }
+}
+```
+
+```{r}
+# print results
+print("Genes retaines :")
+print(genes_retained_dfs)
+
+# print("Genes not retained :")
+# print(genes_not_retained_dfs)
+```
+
+The identified marker genes provided a data-driven approach to annotate clusters, complementing the predefined gene list approach.
+
+### 8.2 Number of principal components = 20
+
+```{r}
+sobj_PC20 <- RunPCA(sobj_filtrd, features = VariableFeatures(object = sobj_filtrd))
+```
+
+#### Clustering of the data
+
+```{r}
+# number of PC kepts for the analysis
+nPC = 20 # 10 à 50 avec un pas de 10
+# s-nn graph (nbre de voisin par défaut = 10)
+sobj_PC20 <- FindNeighbors(sobj_PC20, dims = 1:nPC) 
+# make the clusters (here we try 3 resolutions)
+sobj_PC20 <- FindClusters(sobj_PC20, resolution = c(0.2,0.5,1)) 
+```
+
+#### Visualization of clusters on UMAP
+
+```{r}
+#create umap
+sobj_PC20 <- RunUMAP(sobj_PC20, dims = 1:nPC)
+```
+
+Visualize clusters on UMAP:
+
+```{r}
+# specify the clustering we want to see
+Idents(sobj_PC20) <- 'RNA_snn_res.0.2'
+DimPlot(sobj_PC20, reduction = "umap", label=TRUE)  + 
+  ggtitle("UMAP visualization of cell clusters with 20 PC (Resolution: 0.2)")+
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+#### Manual annotation of clusters
+
+```{r}
+VlnPlot(sobj_PC20, features = marker_genes$muscle)
+FeaturePlot(sobj_PC20, features = marker_genes$muscle)
+
+# nombre de gènes retenus par cluster
+sapply(marker_genes, length)
+```
+
+```{r}
+# Add score for each cell 
+indices_to_remove <- c()
+j <- 1
+
+for (i in seq(1, length(marker_genes))) {
+    #check marker is present in our dataset
+    marker_genes[[i]] <- marker_genes[[i]][which(marker_genes[[i]] %in% rownames(sobj_PC20))]
+    
+    if(length(marker_genes[[i]]) > 1) {
+    sobj_PC20 <- AddModuleScore(sobj_PC20,
+                                 features = marker_genes[i],
+                                 pool = NULL,
+                                 nbin = 5,
+                                 seed = 1,
+                                 ctrl = length(marker_genes[i]),
+                                 k = FALSE,
+                                 name = names(marker_genes[i]))
+    col_name <- names(marker_genes)[[i]]
+    col_name_val <- which(colnames(sobj_PC20[[]]) == paste0(col_name, 1))
+    colnames(sobj_PC20@meta.data)[col_name_val] <- col_name
+    } else {
+        indices_to_remove[j] <- i
+        j <- j + 1
+    }
+}
+
+marker_genes[indices_to_remove] <- NULL
+```
+
+```{r}
+for (f in names(marker_genes)){
+  print(VlnPlot(sobj_PC20, features = f))
+  print(FeaturePlot(sobj_PC20, features = f))
+}
+```
+
+#### Identification of marker genes using FindMarkers
+
+```{r}
+retained <- list()
+not_retained <- list()
+
+for (cluster in levels(Idents(sobj_PC20))) {
+  # find markers for the current cluster
+  markers <- FindMarkers(sobj_PC20, ident.1 = cluster, min.pct = 0.25)
+  
+  # thresholds
+  retained_df <- markers[markers$avg_log2FC > 2 & markers$p_val_adj < 0.05, ]
+  not_retained_df <- markers[!(markers$avg_log2FC > 2 & markers$p_val_adj < 0.05), ]
+  
+  if (nrow(retained_df) > 0) {
+    retained_df$cluster <- cluster
+    retained[[paste0("cluster_", cluster)]] <- retained_df
+  }
+  
+  if (nrow(not_retained_df) > 0) {
+    not_retained_df$cluster <- cluster
+    not_retained[[paste0("cluster_", cluster)]] <- not_retained_df
+  }
+}
+```
+
+```{r}
+# afficher les 5 premiers gènes retenus pour chaque cluster
+for (cluster_name in names(retained)) {
+  cat("\nCluster:", cluster_name, "\n")
+  print(head(retained[[cluster_name]], 5))
+}
+```
+
+```{r}
+genes_retained_dfs <- list()
+genes_not_retained_dfs <- list()
+
+for (cluster in levels(Idents(sobj_PC20))) {
+  # clusters' markers
+  markers <- FindMarkers(sobj_PC20, ident.1 = cluster, min.pct = 0.25)
+  
+  retained_df <- data.frame()
+  not_retained_df <- data.frame()
+  
+  for (category in names(marker_genes)) {
+    genes_in_category <- marker_genes[[category]]
+    
+    # Criteria filtering
+    retained <- markers[rownames(markers) %in% genes_in_category & 
+                        markers$avg_log2FC > 2 & 
+                        markers$p_val_adj < 0.05, ]
+    
+    not_retained <- markers[rownames(markers) %in% genes_in_category & 
+                            !(markers$avg_log2FC > 1 & markers$p_val_adj < 0.05), ]
+    
+    if (nrow(retained) > 0) {
+      retained$category <- category
+      retained_df <- rbind(retained_df, retained)
+    }
+    if (nrow(not_retained) > 0) {
+      not_retained$category <- category
+      not_retained_df <- rbind(not_retained_df, not_retained)
+    }
+  }
+  
+  # Store the results in lists by cluster
+  if (nrow(retained_df) > 0) {
+    genes_retained_dfs[[paste0("cluster_", cluster)]] <- retained_df
+  }
+  if (nrow(not_retained_df) > 0) {
+    genes_not_retained_dfs[[paste0("cluster_", cluster)]] <- not_retained_df
+  }
+}
+```
+
+```{r}
+# print results
+print("Genes retaines :")
+print(genes_retained_dfs)
+
+# print("Genes not retained :")
+# print(genes_not_retained_dfs)
+```
+
+### 8.3 Number of principal components = 30
+
+```{r}
+sobj_PC30 <- RunPCA(sobj_filtrd, features = VariableFeatures(object = sobj_filtrd))
+```
+
+#### Clustering of the data
+
+```{r}
+# number of PC kepts for the analysis
+nPC = 30 # 10 à 50 avec un pas de 10
+# s-nn graph (nbre de voisin par défaut = 10)
+sobj_PC30 <- FindNeighbors(sobj_PC30, dims = 1:nPC) 
+# make the clusters (here we try 3 resolutions)
+sobj_PC30 <- FindClusters(sobj_PC30, resolution = c(0.2,0.5,1)) 
+```
+
+#### Visualization of clusters on UMAP
+
+```{r}
+#create umap
+sobj_PC30 <- RunUMAP(sobj_PC30, dims = 1:nPC)
+```
+
+Visualize clusters on UMAP:
+
+```{r}
+# specify the clustering we want to see
+Idents(sobj_PC30) <- 'RNA_snn_res.0.2'
+DimPlot(sobj_PC30, reduction = "umap", label=TRUE) +
+  ggtitle("UMAP visualization of cell clusters with 30 PC (Resolution: 0.2)") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+#### Manual annotation of clusters
+
+```{r}
+# Add score for each cell 
+indices_to_remove <- c()
+j <- 1
+
+for (i in seq(1, length(marker_genes))) {
+    #check marker is present in our dataset
+    marker_genes[[i]] <- marker_genes[[i]][which(marker_genes[[i]] %in% rownames(sobj_PC30))]
+    
+    if(length(marker_genes[[i]]) > 1) {
+    sobj_PC30 <- AddModuleScore(sobj_PC30,
+                                 features = marker_genes[i],
+                                 pool = NULL,
+                                 nbin = 5,
+                                 seed = 1,
+                                 ctrl = length(marker_genes[i]),
+                                 k = FALSE,
+                                 name = names(marker_genes[i]))
+    col_name <- names(marker_genes)[[i]]
+    col_name_val <- which(colnames(sobj_PC30[[]]) == paste0(col_name, 1))
+    colnames(sobj_PC30@meta.data)[col_name_val] <- col_name
+    } else {
+        indices_to_remove[j] <- i
+        j <- j + 1
+    }
+}
+
+marker_genes[indices_to_remove] <- NULL
+```
+
+```{r}
+for (f in names(marker_genes)){
+  print(VlnPlot(sobj_PC30, features = f))
+  print(FeaturePlot(sobj_PC30, features = f))
+}
+```
+
+#### Identification of marker genes using FindMarkers
+
+```{r}
+retained <- list()
+not_retained <- list()
+
+for (cluster in levels(Idents(sobj_PC30))) {
+  # find markers for the current cluster
+  markers <- FindMarkers(sobj_PC30, ident.1 = cluster, min.pct = 0.25)
+  
+  # thresholds
+  retained_df <- markers[markers$avg_log2FC > 2 & markers$p_val_adj < 0.05, ]
+  not_retained_df <- markers[!(markers$avg_log2FC > 2 & markers$p_val_adj < 0.05), ]
+  
+  if (nrow(retained_df) > 0) {
+    retained_df$cluster <- cluster
+    retained[[paste0("cluster_", cluster)]] <- retained_df
+  }
+  
+  if (nrow(not_retained_df) > 0) {
+    not_retained_df$cluster <- cluster
+    not_retained[[paste0("cluster_", cluster)]] <- not_retained_df
+  }
+}
+```
+
+```{r}
+# afficher les 5 premiers gènes retenus pour chaque cluster
+for (cluster_name in names(retained)) {
+  cat("\nCluster:", cluster_name, "\n")
+  print(head(retained[[cluster_name]], 5))
+}
+```
+
+```{r}
+genes_retained_dfs <- list()
+genes_not_retained_dfs <- list()
+
+for (cluster in levels(Idents(sobj_PC30))) {
+  # clusters' markers
+  markers <- FindMarkers(sobj_PC30, ident.1 = cluster, min.pct = 0.25)
+  
+  retained_df <- data.frame()
+  not_retained_df <- data.frame()
+  
+  for (category in names(marker_genes)) {
+    genes_in_category <- marker_genes[[category]]
+    
+    # Criteria filtering
+    retained <- markers[rownames(markers) %in% genes_in_category & 
+                        markers$avg_log2FC > 2 & 
+                        markers$p_val_adj < 0.05, ]
+    
+    not_retained <- markers[rownames(markers) %in% genes_in_category & 
+                            !(markers$avg_log2FC > 1 & markers$p_val_adj < 0.05), ]
+    
+    if (nrow(retained) > 0) {
+      retained$category <- category
+      retained_df <- rbind(retained_df, retained)
+    }
+    if (nrow(not_retained) > 0) {
+      not_retained$category <- category
+      not_retained_df <- rbind(not_retained_df, not_retained)
+    }
+  }
+  
+  # Store the results in lists by cluster
+  if (nrow(retained_df) > 0) {
+    genes_retained_dfs[[paste0("cluster_", cluster)]] <- retained_df
+  }
+  if (nrow(not_retained_df) > 0) {
+    genes_not_retained_dfs[[paste0("cluster_", cluster)]] <- not_retained_df
+  }
+}
+```
+
+```{r}
+# print results
+print("Genes retaines :")
+print(genes_retained_dfs)
+
+# print("Genes not retained :")
+# print(genes_not_retained_dfs)
+```
+
+```{r}
+unique(Idents(sobj_PC30))
+sobj_PC30 <- RenameIdents(
+  object = sobj_PC30,
+  '1' = 'epithelium',
+  '0' = 'muscles',    
+  '4' = 'développement vasculaire',
+  '6' = 'NA',    
+  '2' = 'sop',
+  '3' = 'sop',
+  '5' = 'tendon/muscle',
+  '7' = 'cellules photoréceptrices'      
+)
+```
+
+```{r}
+plot <- DimPlot(sobj_PC30, reduction = "umap") +
+  ggtitle("UMAP with 30 PCs and manual annotation")
+print(plot)
+```
+
+### 8.4 Number of principal components = 40
+
+```{r}
+sobj_PC40 <- RunPCA(sobj_filtrd, features = VariableFeatures(object = sobj_filtrd))
+```
+
+#### Clustering of the data
+
+```{r}
+# number of PC kepts for the analysis
+nPC = 40 # 10 à 50 avec un pas de 10
+# s-nn graph (nbre de voisin par défaut = 10)
+sobj_PC40 <- FindNeighbors(sobj_PC40, dims = 1:nPC) 
+# make the clusters (here we try 3 resolutions)
+sobj_PC40 <- FindClusters(sobj_PC40, resolution = c(0.2,0.5,1)) 
+```
+
+#### Visualization of clusters on UMAP
+
+```{r}
+#create umap
+sobj_PC40 <- RunUMAP(sobj_PC40, dims = 1:nPC)
+```
+
+Visualize clusters on UMAP:
+
+```{r}
+# specify the clustering we want to see
+Idents(sobj_PC40) <- 'RNA_snn_res.0.2'
+DimPlot(sobj_PC40, reduction = "umap", label=TRUE) +
+  ggtitle("UMAP visualization of cell clusters with 40 PC (Resolution: 0.2)")+
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+#### Manual annotation of clusters
+
+```{r}
+# Add score for each cell 
+indices_to_remove <- c()
+j <- 1
+
+for (i in seq(1, length(marker_genes))) {
+    #check marker is present in our dataset
+    marker_genes[[i]] <- marker_genes[[i]][which(marker_genes[[i]] %in% rownames(sobj_PC40))]
+    
+    if(length(marker_genes[[i]]) > 1) {
+    sobj_PC40 <- AddModuleScore(sobj_PC40,
+                                 features = marker_genes[i],
+                                 pool = NULL,
+                                 nbin = 5,
+                                 seed = 1,
+                                 ctrl = length(marker_genes[i]),
+                                 k = FALSE,
+                                 name = names(marker_genes[i]))
+    col_name <- names(marker_genes)[[i]]
+    col_name_val <- which(colnames(sobj_PC40[[]]) == paste0(col_name, 1))
+    colnames(sobj_PC40@meta.data)[col_name_val] <- col_name
+    } else {
+        indices_to_remove[j] <- i
+        j <- j + 1
+    }
+}
+
+marker_genes[indices_to_remove] <- NULL
+```
+
+```{r}
+for (f in names(marker_genes)){
+  print(VlnPlot(sobj_PC40, features = f))
+  print(FeaturePlot(sobj_PC40, features = f))
+}
+```
+
+#### Identification of marker genes using FindMarkers
+
+```{r}
+retained <- list()
+not_retained <- list()
+
+for (cluster in levels(Idents(sobj_PC40))) {
+  # find markers for the current cluster
+  markers <- FindMarkers(sobj_PC40, ident.1 = cluster, min.pct = 0.25)
+  
+  # thresholds
+  retained_df <- markers[markers$avg_log2FC > 2 & markers$p_val_adj < 0.05, ]
+  not_retained_df <- markers[!(markers$avg_log2FC > 2 & markers$p_val_adj < 0.05), ]
+  
+  if (nrow(retained_df) > 0) {
+    retained_df$cluster <- cluster
+    retained[[paste0("cluster_", cluster)]] <- retained_df
+  }
+  
+  if (nrow(not_retained_df) > 0) {
+    not_retained_df$cluster <- cluster
+    not_retained[[paste0("cluster_", cluster)]] <- not_retained_df
+  }
+}
+```
+
+```{r}
+# afficher les 5 premiers gènes retenus pour chaque cluster
+for (cluster_name in names(retained)) {
+  cat("\nCluster:", cluster_name, "\n")
+  print(head(retained[[cluster_name]], 5))
+}
+```
+
+```{r}
+genes_retained_dfs <- list()
+genes_not_retained_dfs <- list()
+
+for (cluster in levels(Idents(sobj_PC40))) {
+  # clusters' markers
+  markers <- FindMarkers(sobj_PC40, ident.1 = cluster, min.pct = 0.25)
+  
+  retained_df <- data.frame()
+  not_retained_df <- data.frame()
+  
+  for (category in names(marker_genes)) {
+    genes_in_category <- marker_genes[[category]]
+    
+    # Criteria filtering
+    retained <- markers[rownames(markers) %in% genes_in_category & 
+                        markers$avg_log2FC > 2 & 
+                        markers$p_val_adj < 0.05, ]
+    
+    not_retained <- markers[rownames(markers) %in% genes_in_category & 
+                            !(markers$avg_log2FC > 1 & markers$p_val_adj < 0.05), ]
+    
+    if (nrow(retained) > 0) {
+      retained$category <- category
+      retained_df <- rbind(retained_df, retained)
+    }
+    if (nrow(not_retained) > 0) {
+      not_retained$category <- category
+      not_retained_df <- rbind(not_retained_df, not_retained)
+    }
+  }
+  
+  # Store the results in lists by cluster
+  if (nrow(retained_df) > 0) {
+    genes_retained_dfs[[paste0("cluster_", cluster)]] <- retained_df
+  }
+  if (nrow(not_retained_df) > 0) {
+    genes_not_retained_dfs[[paste0("cluster_", cluster)]] <- not_retained_df
+  }
+}
+```
+
+```{r}
+# print results
+print("Genes retaines :")
+print(genes_retained_dfs)
+
+# print("Genes not retained :")
+# print(genes_not_retained_dfs)
+```
+
+### 8.5 Number of principal components = 50
+
+```{r}
+sobj_PC50 <- RunPCA(sobj_filtrd, features = VariableFeatures(object = sobj_filtrd))
+```
+
+#### Clustering of the data
+
+```{r}
+# number of PC kepts for the analysis
+nPC = 50 # 10 à 50 avec un pas de 10
+# s-nn graph (nbre de voisin par défaut = 10)
+sobj_PC50 <- FindNeighbors(sobj_PC50, dims = 1:nPC) 
+# make the clusters (here we try 3 resolutions)
+sobj_PC50 <- FindClusters(sobj_PC50, resolution = c(0.2,0.5,1)) 
+```
+
+#### Visualization of clusters on UMAP
+
+```{r}
+#create umap
+sobj_PC50 <- RunUMAP(sobj_PC50, dims = 1:nPC)
+```
+
+Visualize clusters on UMAP:
+
+```{r}
+# specify the clustering we want to see
+Idents(sobj_PC50) <- 'RNA_snn_res.0.2'
+DimPlot(sobj_PC50, reduction = "umap", label=TRUE) +
+  ggtitle("UMAP visualization of cell clusters with 50 PC (Resolution: 0.2)")+
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+#### Manual annotation of clusters
+
+```{r}
+# Add score for each cell 
+indices_to_remove <- c()
+j <- 1
+
+for (i in seq(1, length(marker_genes))) {
+    #check marker is present in our dataset
+    marker_genes[[i]] <- marker_genes[[i]][which(marker_genes[[i]] %in% rownames(sobj_PC50))]
+    
+    if(length(marker_genes[[i]]) > 1) {
+    sobj_PC50 <- AddModuleScore(sobj_PC50,
+                                 features = marker_genes[i],
+                                 pool = NULL,
+                                 nbin = 5,
+                                 seed = 1,
+                                 ctrl = length(marker_genes[i]),
+                                 k = FALSE,
+                                 name = names(marker_genes[i]))
+    col_name <- names(marker_genes)[[i]]
+    col_name_val <- which(colnames(sobj_PC50[[]]) == paste0(col_name, 1))
+    colnames(sobj_PC50@meta.data)[col_name_val] <- col_name
+    } else {
+        indices_to_remove[j] <- i
+        j <- j + 1
+    }
+}
+
+marker_genes[indices_to_remove] <- NULL
+```
+
+```{r}
+for (f in names(marker_genes)){
+  print(VlnPlot(sobj_PC50, features = f))
+  print(FeaturePlot(sobj_PC50, features = f))
+}
+```
+
+#### Identification of marker genes using FindMarkers
+
+```{r}
+retained <- list()
+not_retained <- list()
+
+for (cluster in levels(Idents(sobj_PC50))) {
+  # find markers for the current cluster
+  markers <- FindMarkers(sobj_PC50, ident.1 = cluster, min.pct = 0.25)
+  
+  # thresholds
+  retained_df <- markers[markers$avg_log2FC > 2 & markers$p_val_adj < 0.05, ]
+  not_retained_df <- markers[!(markers$avg_log2FC > 2 & markers$p_val_adj < 0.05), ]
+  
+  if (nrow(retained_df) > 0) {
+    retained_df$cluster <- cluster
+    retained[[paste0("cluster_", cluster)]] <- retained_df
+  }
+  
+  if (nrow(not_retained_df) > 0) {
+    not_retained_df$cluster <- cluster
+    not_retained[[paste0("cluster_", cluster)]] <- not_retained_df
+  }
+}
+```
+
+```{r}
+# afficher les 5 premiers gènes retenus pour chaque cluster
+for (cluster_name in names(retained)) {
+  cat("\nCluster:", cluster_name, "\n")
+  print(head(retained[[cluster_name]], 5))
+}
+```
+
+```{r}
+genes_retained_dfs <- list()
+genes_not_retained_dfs <- list()
+
+for (cluster in levels(Idents(sobj_PC50))) {
+  # clusters' markers
+  markers <- FindMarkers(sobj_PC50, ident.1 = cluster, min.pct = 0.25)
+  
+  retained_df <- data.frame()
+  not_retained_df <- data.frame()
+  
+  for (category in names(marker_genes)) {
+    genes_in_category <- marker_genes[[category]]
+    
+    # Criteria filtering
+    retained <- markers[rownames(markers) %in% genes_in_category & 
+                        markers$avg_log2FC > 2 & 
+                        markers$p_val_adj < 0.05, ]
+    
+    not_retained <- markers[rownames(markers) %in% genes_in_category & 
+                            !(markers$avg_log2FC > 1 & markers$p_val_adj < 0.05), ]
+    
+    if (nrow(retained) > 0) {
+      retained$category <- category
+      retained_df <- rbind(retained_df, retained)
+    }
+    if (nrow(not_retained) > 0) {
+      not_retained$category <- category
+      not_retained_df <- rbind(not_retained_df, not_retained)
+    }
+  }
+  
+  # Store the results in lists by cluster
+  if (nrow(retained_df) > 0) {
+    genes_retained_dfs[[paste0("cluster_", cluster)]] <- retained_df
+  }
+  if (nrow(not_retained_df) > 0) {
+    genes_not_retained_dfs[[paste0("cluster_", cluster)]] <- not_retained_df
+  }
+}
+```
+
+```{r}
+# print results
+print("Genes retaines :")
+print(genes_retained_dfs)
+
+# print("Genes not retained :")
+# print(genes_not_retained_dfs)
+```
+
+## 9. Reproducibility of results
+
+```{r session-info, echo=TRUE}
+# Charger les informations de la session pour la reproductibilité
+sessionInfo()
+```
