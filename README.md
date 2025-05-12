@@ -1,1 +1,3 @@
 # Single-cell-Analysis-Pipeline
+
+Ce projet a réalisé une analyse de transcriptomique unicellulaire (scRNA-seq) sur Drosophila melanogaster afin d’identifier et caractériser différents types cellulaires. Après réduction de dimension par ACP (PCA), 30 composantes principales ont été retenues comme optimum. L’analyse UMAP a révélé 8 clusters représentant des types cellulaires distincts (cellules musculaires, tendineuses, épithéliales, etc.). L’annotation manuelle à partir de gènes marqueurs a confirmé ces identités, malgré un certain chevauchement. Le projet souligne l’impact du choix de la dimensionnalité sur la qualité du clustering et met en lumière des signatures moléculaires clés.
